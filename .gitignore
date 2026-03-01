@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# Debug artifacts
+debug_grid.png
+calibration_capture.png
+calibration_thumbnail.png
+
+# Files with hardcoded API keys (unused legacy files)
+check_live.py
+deploy.sh
+deploy.bat
+
+# Environment / secrets
+.env
+*.env

@@ -1,5 +1,5 @@
 """
-Transparent overlay window for Ghost Tutor.
+Transparent overlay window for Learn With Gemini.
 Renders arrows, text boxes, and highlight regions on top of the user's screen.
 Click-through so it never interferes with normal interaction.
 Also provides a status bar and subtitle display.
@@ -41,7 +41,7 @@ class OverlaySignals(QObject):
     set_current_task = pyqtSignal(str)               # instruction text
 
 
-class GhostOverlay(QWidget):
+class TutorOverlay(QWidget):
     def __init__(self):
         super().__init__()
         self.signals = OverlaySignals()
@@ -435,7 +435,7 @@ class StatusWidget(QWidget):
 
         menu.addSeparator()
 
-        exit_action = QAction("Exit Ghost Tutor", self)
+        exit_action = QAction("Exit Learn With Gemini", self)
         exit_action.triggered.connect(self._on_exit)
         menu.addAction(exit_action)
 

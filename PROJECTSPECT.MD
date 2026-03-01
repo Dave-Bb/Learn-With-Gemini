@@ -1,7 +1,7 @@
-# Project Specification: Ghost Tutor (Gemini Live Hackathon)
+# Project Specification: Learn With Gemini (Gemini Live Hackathon)
 
 ## Overview
-Ghost Tutor is a real-time, vision-enabled AI assistant designed to break the "text box" paradigm. It observes the user's screen, listens to their microphone, speaks back with natively generated audio, and physically points to UI elements on the user's screen using a transparent overlay. 
+Learn With Gemini is a real-time, vision-enabled AI assistant designed to break the "text box" paradigm. It observes the user's screen, listens to their microphone, speaks back with natively generated audio, and physically points to UI elements on the user's screen using a transparent overlay. 
 
 **Hackathon Track:** Live Agents 🗣️ (Also touches UI Navigator ☸️)
 **Core Tech:** Gemini Multimodal Live API, Google GenAI SDK, Google Cloud Run, PyQt6, FastAPI.
@@ -12,7 +12,7 @@ The application is split into two components to satisfy the Hackathon's Cloud Ho
 1.  **Cloud Relay (FastAPI - Backend)**
     * **Host:** Google Cloud Run.
     * **Role:** Acts as the secure WebSocket proxy between the Desktop Client and the Gemini Live API. It holds the Google API keys and manages the session configuration, including the system instructions and tool definitions (function declarations).
-2.  **Ghost Client (Python/PyQt6 - Frontend)**
+2.  **Desktop Client (Python/PyQt6 - Frontend)**
     * **Host:** User's local machine.
     * **Role:** Captures microphone audio (16kHz PCM) and screen frames (1 FPS via `mss`). It streams these to the Cloud Relay. It also runs a frameless, 100% transparent PyQt6 window that ignores mouse clicks. When it receives a `draw_hint` command from the backend, it renders graphics (arrows, text boxes) onto this transparent canvas.
 

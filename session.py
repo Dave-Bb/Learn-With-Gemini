@@ -1,10 +1,11 @@
 """
-Gemini Live API session manager for Ghost Tutor.
+Gemini Live API session manager for Learn With Gemini.
 Handles the bidirectional streaming: mic + screen → Gemini → audio + tool calls.
 Auto-reconnects on server errors.
 """
 
 import asyncio
+import base64
 import io
 import os
 import random
@@ -14,6 +15,7 @@ import struct
 from dotenv import load_dotenv
 load_dotenv()
 
+import aiohttp
 import mss
 from PIL import Image, ImageDraw, ImageFont
 from google import genai
@@ -116,7 +118,7 @@ def grid_cell_to_rect(cell_name, screen_w, screen_h):
     return (col * cell_w, row * cell_h, cell_w, cell_h)
 
 SYSTEM_PROMPT = """\
-You are Ghost Tutor, a screen-aware teaching assistant. You see the user's screen, hear them speak, and speak back.
+You are Learn With Gemini, a screen-aware teaching assistant. You see the user's screen, hear them speak, and speak back.
 
 Tutorial: {topic}
 Steps: {steps_text}
@@ -176,6 +178,9 @@ internal use. Focus on the actual screen content.
 # Vision model — used for precise element location (much better than audio model)
 VISION_MODEL = "gemini-3.1-flash-image-preview"
 
+# Cloud Run URL — vision calls are routed through this service
+CLOUD_RUN_URL = os.environ.get("CLOUD_RUN_URL", "")
+
 VISION_PROMPT = """\
 Look at this screenshot. It has a grid overlay with columns A-P (left to right) \
 and rows 1-9 (top to bottom). Each cell is labeled with yellow text like A1, B2, etc.
@@ -198,7 +203,7 @@ Describe what you see on this screen. Be concise and factual. Focus on:
 If there is an error message, quote it exactly. Keep your response under 150 words."""
 
 
-class GhostSession:
+class TutorSession:
     def __init__(self, topic: str, overlay_signals: OverlaySignals, audio: AudioManager,
                  logical_w: int = 1920, logical_h: int = 1080):
         self.topic = topic
@@ -253,23 +258,31 @@ class GhostSession:
         print("Session ended.")
 
     async def _generate_plan(self, topic: str) -> list:
-        """Use the vision model to pre-generate a tutorial plan."""
+        """Use Cloud Run vision service to pre-generate a tutorial plan."""
         print(f"[plan] Generating tutorial plan for: '{topic}'")
         self.overlay.set_status.emit("Planning tutorial...")
         try:
-            response = await self._client.aio.models.generate_content(
-                model=VISION_MODEL,
-                contents=[{"role": "user", "parts": [{"text": PLAN_PROMPT.format(topic=topic)}]}],
-            )
-            lines = [line.strip() for line in response.text.strip().split("\n") if line.strip()]
-            # Remove any numbering/bullets the model might add
-            clean = []
-            for line in lines:
-                # Strip leading "1.", "1)", "- ", "* " etc.
-                cleaned = re.sub(r"^[\d]+[.)]\s*", "", line)
-                cleaned = re.sub(r"^[-*]\s*", "", cleaned)
-                if cleaned:
-                    clean.append(cleaned)
+            if CLOUD_RUN_URL:
+                async with aiohttp.ClientSession() as http:
+                    async with http.post(
+                        f"{CLOUD_RUN_URL}/generate-plan",
+                        json={"topic": topic},
+                    ) as resp:
+                        data = await resp.json()
+                        clean = data.get("steps", ["Follow the tutorial instructions"])
+            else:
+                # Fallback: direct API call if no Cloud Run URL configured
+                response = await self._client.aio.models.generate_content(
+                    model=VISION_MODEL,
+                    contents=[{"role": "user", "parts": [{"text": PLAN_PROMPT.format(topic=topic)}]}],
+                )
+                lines = [line.strip() for line in response.text.strip().split("\n") if line.strip()]
+                clean = []
+                for line in lines:
+                    cleaned = re.sub(r"^[\d]+[.)]\s*", "", line)
+                    cleaned = re.sub(r"^[-*]\s*", "", cleaned)
+                    if cleaned:
+                        clean.append(cleaned)
             print(f"[plan] Generated {len(clean)} steps:")
             for i, s in enumerate(clean):
                 print(f"       {i+1}. {s}")
@@ -468,10 +481,10 @@ class GhostSession:
                     await self._handle_tool_calls(session, response.tool_call)
 
     async def _vision_find(self, description: str) -> str:
-        """Use regular Gemini vision model to find an element on screen.
+        """Use Cloud Run vision service to find an element on screen.
 
         Takes a fresh screenshot, adds the grid overlay, sends it to the
-        vision model, and returns the grid cell reference (e.g. 'B3').
+        Cloud Run service, and returns the grid cell reference (e.g. 'B3').
         """
         # Grab fresh screenshot with grid
         sct_img = self._screen.grab(self._monitor)
@@ -483,39 +496,49 @@ class GhostSession:
         grid_img.save(buffer, format="JPEG", quality=85)
         jpeg_bytes = buffer.getvalue()
 
-        prompt = VISION_PROMPT.format(description=description)
-
-        print(f"[vision] Asking {VISION_MODEL} to find: '{description}'")
+        print(f"[vision] Finding: '{description}'")
         try:
-            response = await self._client.aio.models.generate_content(
-                model=VISION_MODEL,
-                contents=[{
-                    "role": "user",
-                    "parts": [
-                        {"inline_data": {"mime_type": "image/jpeg", "data": jpeg_bytes}},
-                        {"text": prompt},
-                    ],
-                }],
-            )
-            cell = response.text.strip().upper()
-            # Validate — should be like "A1" to "P9"
+            if CLOUD_RUN_URL:
+                img_b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
+                async with aiohttp.ClientSession() as http:
+                    async with http.post(
+                        f"{CLOUD_RUN_URL}/find-element",
+                        json={"description": description, "image": img_b64},
+                    ) as resp:
+                        data = await resp.json()
+                        cell = data.get("cell", "D3").strip().upper()
+            else:
+                # Fallback: direct API call
+                prompt = VISION_PROMPT.format(description=description)
+                response = await self._client.aio.models.generate_content(
+                    model=VISION_MODEL,
+                    contents=[{
+                        "role": "user",
+                        "parts": [
+                            {"inline_data": {"mime_type": "image/jpeg", "data": jpeg_bytes}},
+                            {"text": prompt},
+                        ],
+                    }],
+                )
+                cell = response.text.strip().upper()
+
             if len(cell) >= 2 and cell[0].isalpha() and cell[1:].isdigit():
                 print(f"[vision] Found: cell {cell}")
                 return cell
             else:
-                print(f"[vision] Unexpected response: '{response.text}', defaulting to D3")
+                print(f"[vision] Unexpected response: '{cell}', defaulting to D3")
                 return "D3"
         except Exception as e:
             print(f"[vision] ERROR: {e}")
             return "D3"
 
     async def _periodic_vision_check(self, session):
-        """Periodically send screenshots to the vision model for screen reading.
+        """Periodically send screenshots to Cloud Run for screen reading.
 
         The audio model can't reliably read text on screen (errors, code, terminal output).
-        This sends clean screenshots (no grid) to the vision model, which describes what it
-        sees. That description is injected into the Live session so the audio model has
-        accurate context.
+        This sends clean screenshots (no grid) to the Cloud Run vision service, which
+        describes what it sees. That description is injected into the Live session so the
+        audio model has accurate context.
         """
         while self._running:
             await asyncio.sleep(SCREEN_CHECK_INTERVAL)
@@ -536,17 +559,29 @@ class GhostSession:
                 img.save(buffer, format="JPEG", quality=80)
                 jpeg_bytes = buffer.getvalue()
 
-                response = await self._client.aio.models.generate_content(
-                    model=VISION_MODEL,
-                    contents=[{
-                        "role": "user",
-                        "parts": [
-                            {"inline_data": {"mime_type": "image/jpeg", "data": jpeg_bytes}},
-                            {"text": SCREEN_CHECK_PROMPT},
-                        ],
-                    }],
-                )
-                description = response.text.strip()
+                if CLOUD_RUN_URL:
+                    img_b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
+                    async with aiohttp.ClientSession() as http:
+                        async with http.post(
+                            f"{CLOUD_RUN_URL}/analyze-screen",
+                            json={"image": img_b64},
+                        ) as resp:
+                            data = await resp.json()
+                            description = data.get("description", "")
+                else:
+                    # Fallback: direct API call
+                    response = await self._client.aio.models.generate_content(
+                        model=VISION_MODEL,
+                        contents=[{
+                            "role": "user",
+                            "parts": [
+                                {"inline_data": {"mime_type": "image/jpeg", "data": jpeg_bytes}},
+                                {"text": SCREEN_CHECK_PROMPT},
+                            ],
+                        }],
+                    )
+                    description = response.text.strip()
+
                 print(f"[vision-check] {description[:120]}")
 
                 # Inject into the Live session as context for the audio model

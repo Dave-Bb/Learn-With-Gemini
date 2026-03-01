@@ -1,5 +1,5 @@
 """
-Audio capture (microphone) and playback (speaker) for Ghost Tutor.
+Audio capture (microphone) and playback (speaker) for Learn With Gemini.
 Uses pyaudio with async queues for integration with the Gemini session.
 """
 

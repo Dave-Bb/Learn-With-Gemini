@@ -1,10 +1,10 @@
 """
-Ghost Tutor — Interactive AI Screen Tutor
+Learn With Gemini — Interactive AI Screen Tutor
 Main entry point with launcher UI.
 
 Usage:
     set GOOGLE_API_KEY=your-key-here
-    python ghost_tutor.py
+    python learn_with_gemini.py
 """
 
 import sys
@@ -25,9 +25,9 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QFont, QColor, QPalette
 
-from overlay import GhostOverlay, StatusWidget, SubtitleWidget, TutorialPanelWidget
+from overlay import TutorOverlay, StatusWidget, SubtitleWidget, TutorialPanelWidget
 from audio import AudioManager
-from session import GhostSession
+from session import TutorSession
 
 
 # Predefined tutorial topics
@@ -47,7 +47,7 @@ class LauncherWindow(QWidget):
         self._init_ui()
 
     def _init_ui(self):
-        self.setWindowTitle("Ghost Tutor")
+        self.setWindowTitle("Learn With Gemini")
         self.setFixedSize(QSize(520, 560))
         self.setStyleSheet("""
             QWidget {
@@ -87,7 +87,7 @@ class LauncherWindow(QWidget):
         layout.setContentsMargins(30, 30, 30, 30)
 
         # Title
-        title = QLabel("Ghost Tutor")
+        title = QLabel("Learn With Gemini")
         title.setFont(QFont("Segoe UI", 24, QFont.Weight.Bold))
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet("color: #53a8ff; margin-bottom: 4px;")
@@ -159,7 +159,7 @@ class LauncherWindow(QWidget):
 def run_session_thread(topic: str, overlay_signals, logical_w: int, logical_h: int):
     """Run the Gemini session in a background thread with its own event loop."""
     audio = AudioManager()
-    session = GhostSession(topic, overlay_signals, audio, logical_w, logical_h)
+    session = TutorSession(topic, overlay_signals, audio, logical_w, logical_h)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -184,11 +184,11 @@ def main():
         return
 
     topic = launcher.selected_topic
-    print(f"\nStarting Ghost Tutor session: {topic}\n")
+    print(f"\nStarting Learn With Gemini session: {topic}\n")
 
     # Create overlay, status bar, and subtitle bar
     overlay_app = QApplication.instance() or QApplication(sys.argv)
-    overlay = GhostOverlay()
+    overlay = TutorOverlay()
     overlay.show()
 
     status = StatusWidget()

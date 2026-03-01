@@ -17,10 +17,9 @@ debug_grid.png
 calibration_capture.png
 calibration_thumbnail.png
 
-# Files with hardcoded API keys (unused legacy files)
+# Unused legacy files with hardcoded API keys
 check_live.py
 deploy.sh
-deploy.bat
 
 # Environment / secrets
 .env

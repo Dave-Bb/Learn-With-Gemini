@@ -6,12 +6,12 @@ import sys
 import time
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import QTimer
-from overlay import GhostOverlay, StatusWidget
+from overlay import TutorOverlay, StatusWidget
 
 
 def main():
     app = QApplication(sys.argv)
-    overlay = GhostOverlay()
+    overlay = TutorOverlay()
     overlay.show()
 
     status = StatusWidget()

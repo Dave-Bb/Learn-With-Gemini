@@ -7,7 +7,10 @@ Also provides a status bar and subtitle display.
 
 import math
 import time
-from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QMenu
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QLabel, QMenu,
+    QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QFrame,
+)
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QRectF, QPointF
 from PyQt6.QtGui import (
     QPainter,
@@ -39,6 +42,8 @@ class OverlaySignals(QObject):
     set_current_step = pyqtSignal(int)               # 1-based step number
     complete_step = pyqtSignal(int)                   # 1-based step number
     set_current_task = pyqtSignal(str)               # instruction text
+    # Connection lifecycle
+    connection_ready = pyqtSignal()                  # fired when Gemini session is live
 
 
 class TutorOverlay(QWidget):
@@ -766,3 +771,251 @@ class TutorialPanelWidget(QWidget):
                 painter.drawText(12, badge_y + 36 + i * task_line_h, line)
 
         painter.end()
+
+
+class LoadingWidget(QWidget):
+    """Loading screen with spinner and status log — shown during initial connection."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        screen = QApplication.primaryScreen().geometry()
+        panel_w = 420
+        panel_h = 320
+        self.setGeometry(
+            (screen.width() - panel_w) // 2,
+            (screen.height() - panel_h) // 2,
+            panel_w, panel_h,
+        )
+        self.setFixedSize(panel_w, panel_h)
+
+        self._angle = 0
+        self._messages = []
+
+        # Spinner animation
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(33)  # ~30fps
+
+    def _tick(self):
+        self._angle = (self._angle + 8) % 360
+        self.update()
+
+    def add_message(self, text: str):
+        self._messages.append(text)
+        if len(self._messages) > 8:
+            self._messages = self._messages[-8:]
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # Background — fully opaque
+        painter.setPen(QPen(QColor(15, 52, 96), 1))
+        painter.setBrush(QBrush(QColor(18, 18, 36)))
+        painter.drawRoundedRect(0, 0, w, h, 12, 12)
+
+        # Title
+        painter.setPen(QPen(QColor(83, 168, 255)))
+        painter.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+        title_rect = QRectF(0, 28, w, 36)
+        painter.drawText(title_rect, Qt.AlignmentFlag.AlignCenter, "Learn With Gemini")
+
+        # Subtitle
+        painter.setPen(QPen(QColor(140, 140, 160)))
+        painter.setFont(QFont("Segoe UI", 10))
+        sub_rect = QRectF(0, 62, w, 22)
+        painter.drawText(sub_rect, Qt.AlignmentFlag.AlignCenter, "Setting things up...")
+
+        # Spinner — rotating arc
+        spinner_cx = w // 2
+        spinner_cy = 120
+        spinner_r = 22
+        spinner_rect = QRectF(
+            spinner_cx - spinner_r, spinner_cy - spinner_r,
+            spinner_r * 2, spinner_r * 2,
+        )
+
+        # Background ring
+        painter.setPen(QPen(QColor(40, 50, 80), 3))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(spinner_rect)
+
+        # Spinning arc
+        arc_pen = QPen(QColor(83, 168, 255), 3)
+        arc_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(arc_pen)
+        painter.drawArc(spinner_rect, int(self._angle * 16), int(90 * 16))
+
+        # Divider
+        div_y = 160
+        painter.setPen(QPen(QColor(60, 80, 120, 80), 1))
+        painter.drawLine(24, div_y, w - 24, div_y)
+
+        # Status log
+        painter.setFont(QFont("Segoe UI", 9))
+        log_y = 176
+        line_h = 18
+        for i, msg in enumerate(self._messages):
+            alpha = max(100, 255 - (len(self._messages) - 1 - i) * 30)
+            painter.setPen(QPen(QColor(160, 175, 200, alpha)))
+            painter.drawText(24, log_y + i * line_h, msg)
+
+        painter.end()
+
+
+class TopicMenuWidget(QWidget):
+    """Floating topic selection menu — shown at startup before a tutorial begins."""
+
+    topic_selected = pyqtSignal(str)
+
+    def __init__(self, tutorials):
+        super().__init__()
+        self._tutorials = tutorials
+        self.setWindowFlags(
+            Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        screen = QApplication.primaryScreen().geometry()
+        panel_w = 440
+        panel_h = 500
+        self.setGeometry(
+            (screen.width() - panel_w) // 2,
+            (screen.height() - panel_h) // 2,
+            panel_w, panel_h,
+        )
+        self.setFixedSize(panel_w, panel_h)
+
+        self._drag_pos = None
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout()
+        layout.setSpacing(10)
+        layout.setContentsMargins(28, 28, 28, 28)
+
+        # Title
+        title = QLabel("Learn With Gemini")
+        title.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet("color: #53a8ff; background: transparent;")
+        layout.addWidget(title)
+
+        subtitle = QLabel("Pick a tutorial or tell me what to teach!")
+        subtitle.setFont(QFont("Segoe UI", 10))
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle.setStyleSheet("color: #888; background: transparent; margin-bottom: 8px;")
+        layout.addWidget(subtitle)
+
+        # Tutorial buttons
+        btn_style = """
+            QPushButton {
+                background-color: #16213e;
+                border: 1px solid #0f3460;
+                border-radius: 8px;
+                padding: 12px 14px;
+                color: #eaeaea;
+                font-size: 13px;
+                font-family: 'Segoe UI';
+                text-align: left;
+            }
+            QPushButton:hover {
+                background-color: #0f3460;
+                border-color: #53a8ff;
+            }
+        """
+        for display_name, topic_prompt in self._tutorials:
+            btn = QPushButton(display_name)
+            btn.setStyleSheet(btn_style)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda checked, t=topic_prompt: self._select(t))
+            layout.addWidget(btn)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #333; background: transparent;")
+        layout.addWidget(sep)
+
+        # Custom input
+        custom_label = QLabel("Or describe what you want to learn:")
+        custom_label.setFont(QFont("Segoe UI", 10))
+        custom_label.setStyleSheet("color: #888; background: transparent;")
+        layout.addWidget(custom_label)
+
+        input_row = QHBoxLayout()
+        self._input = QLineEdit()
+        self._input.setPlaceholderText("e.g., How to use Git")
+        self._input.setStyleSheet("""
+            QLineEdit {
+                background-color: #16213e;
+                border: 1px solid #0f3460;
+                border-radius: 8px;
+                padding: 10px;
+                color: #eaeaea;
+                font-size: 13px;
+            }
+            QLineEdit:focus { border-color: #53a8ff; }
+        """)
+        self._input.returnPressed.connect(self._select_custom)
+        input_row.addWidget(self._input)
+
+        go_btn = QPushButton("Go")
+        go_btn.setFixedWidth(50)
+        go_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #53a8ff;
+                color: white;
+                font-weight: bold;
+                border-radius: 8px;
+                padding: 10px;
+                font-family: 'Segoe UI';
+            }
+            QPushButton:hover { background-color: #3d8ce0; }
+        """)
+        go_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        go_btn.clicked.connect(self._select_custom)
+        input_row.addWidget(go_btn)
+
+        layout.addLayout(input_row)
+        layout.addStretch()
+        self.setLayout(layout)
+
+    def _select(self, topic):
+        self.topic_selected.emit(topic)
+
+    def _select_custom(self):
+        text = self._input.text().strip()
+        if text:
+            self.topic_selected.emit(text)
+
+    def paintEvent(self, event):
+        # Draw rounded background — fully opaque
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(15, 52, 96), 1))
+        painter.setBrush(QBrush(QColor(18, 18, 36)))
+        painter.drawRoundedRect(0, 0, self.width(), self.height(), 12, 12)
+        painter.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_pos)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None

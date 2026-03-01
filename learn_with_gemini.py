@@ -25,18 +25,19 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QFont, QColor, QPalette
 
-from overlay import TutorOverlay, StatusWidget, SubtitleWidget, TutorialPanelWidget
+from overlay import TutorOverlay, StatusWidget, SubtitleWidget, TutorialPanelWidget, TopicMenuWidget, LoadingWidget
 from audio import AudioManager
 from session import TutorSession
 
 
 # Predefined tutorial topics
 TUTORIALS = [
-    ("Screen Finder (Calibration)", "CALIBRATION_MODE"),
-    ("Python: Hello World", "Guide the user through writing and running their first Python 'Hello World' program. Start from opening an IDE or text editor."),
-    ("Excel: Basics", "Teach the user the basics of Microsoft Excel — opening it, entering data in cells, basic formulas like SUM, and saving."),
-    ("Web Browsing", "Guide the user through basic web browsing — opening a browser, navigating to a website, using bookmarks, and tabs."),
-    ("VS Code: Getting Started", "Help the user get started with Visual Studio Code — opening it, creating a file, installing extensions, and running code."),
+    ("Google Sheets: Budget Tracker", "Walk the user through creating a simple monthly budget in Google Sheets. Open Chrome, go to sheets.google.com, create a new spreadsheet, add income and expense rows with labels, enter some example numbers, and use the SUM formula to calculate totals."),
+    ("Windows: Change Your Wallpaper", "Guide the user through changing their Windows desktop wallpaper. Right-click the desktop, open Personalize settings, browse backgrounds, pick a new wallpaper, and confirm the change."),
+    ("Snipping Tool: Take a Screenshot", "Teach the user how to take and save a screenshot using the Windows Snipping Tool. Open Snipping Tool from the Start menu, choose a snip mode, capture a region of the screen, and save the image."),
+    ("Paint: Draw a Smiley Face", "Guide the user through drawing a simple smiley face in Microsoft Paint. Open Paint from the Start menu, use the circle tool for the head, add two eyes, draw a curved mouth, pick colors, and save the drawing."),
+    ("Chrome: Install an Extension", "Help the user install a browser extension in Google Chrome. Open Chrome, navigate to the Chrome Web Store, search for an extension like 'Dark Reader', click Add to Chrome, and confirm the installation."),
+    ("Notepad: Write & Save a File", "Guide the user through creating and saving a text file with Notepad. Open Notepad from the Start menu, type a short message, use File > Save As to pick a location and filename, and verify the file was saved."),
 ]
 
 
@@ -156,11 +157,8 @@ class LauncherWindow(QWidget):
         self.close()
 
 
-def run_session_thread(topic: str, overlay_signals, logical_w: int, logical_h: int):
+def run_session_thread(session):
     """Run the Gemini session in a background thread with its own event loop."""
-    audio = AudioManager()
-    session = TutorSession(topic, overlay_signals, audio, logical_w, logical_h)
-
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -174,20 +172,9 @@ def run_session_thread(topic: str, overlay_signals, logical_w: int, logical_h: i
 def main():
     app = QApplication(sys.argv)
 
-    # Show launcher
-    launcher = LauncherWindow()
-    launcher.show()
-    app.exec()
+    print("\nStarting Learn With Gemini...\n")
 
-    if not launcher.selected_topic:
-        print("No topic selected. Exiting.")
-        return
-
-    topic = launcher.selected_topic
-    print(f"\nStarting Learn With Gemini session: {topic}\n")
-
-    # Create overlay, status bar, and subtitle bar
-    overlay_app = QApplication.instance() or QApplication(sys.argv)
+    # Create overlay, status bar, subtitle bar, and tutorial panel
     overlay = TutorOverlay()
     overlay.show()
 
@@ -200,8 +187,17 @@ def main():
     tutorial_panel = TutorialPanelWidget()
     tutorial_panel.show()
 
+    # Loading screen (shown first) and topic menu (shown after connection)
+    loading = LoadingWidget()
+    loading.show()
+    loading.add_message("Initializing...")
+
+    topic_menu = TopicMenuWidget(TUTORIALS)
+    # topic_menu starts hidden — shown when connection is ready
+
     # Wire up all signals
     overlay.signals.set_status.connect(status.set_status)
+    overlay.signals.set_status.connect(loading.add_message)
     overlay.signals.mic_active.connect(status.set_mic_active)
     overlay.signals.speaker_active.connect(status.set_speaker_active)
     overlay.signals.set_subtitle.connect(subtitles.set_subtitle)
@@ -209,14 +205,33 @@ def main():
     overlay.signals.set_current_step.connect(tutorial_panel.set_current_step)
     overlay.signals.complete_step.connect(tutorial_panel.complete_step)
     overlay.signals.set_current_task.connect(tutorial_panel.set_task)
-    status.exit_requested.connect(overlay_app.quit)
+    status.exit_requested.connect(app.quit)
 
     # Get Qt logical screen dimensions — the overlay draws in this coordinate space
-    screen_geo = overlay_app.primaryScreen().geometry()
+    screen_geo = app.primaryScreen().geometry()
     logical_w = screen_geo.width()
     logical_h = screen_geo.height()
-    dpr = overlay_app.primaryScreen().devicePixelRatio()
+    dpr = app.primaryScreen().devicePixelRatio()
     print(f"Qt logical screen: {logical_w}x{logical_h} (DPR={dpr})")
+
+    # Create session in greeting mode (no topic yet)
+    audio = AudioManager()
+    session = TutorSession(None, overlay.signals, audio, logical_w, logical_h)
+
+    # Transition: loading → topic menu when connection is ready
+    def on_connection_ready():
+        loading.hide()
+        topic_menu.show()
+
+    overlay.signals.connection_ready.connect(on_connection_ready)
+
+    # Wire topic selection → session + hide menu
+    def on_topic_selected(topic):
+        topic_menu.hide()
+        session.set_topic(topic)
+        print(f"[menu] Topic selected: {topic}")
+
+    topic_menu.topic_selected.connect(on_topic_selected)
 
     # Move target button — randomly repositions the calibration target
     def move_target():
@@ -229,16 +244,16 @@ def main():
 
     status.move_target_requested.connect(move_target)
 
-    # Start Gemini session in background thread
+    # Start Gemini session in background thread (connects immediately in greeting mode)
     thread = threading.Thread(
         target=run_session_thread,
-        args=(topic, overlay.signals, logical_w, logical_h),
+        args=(session,),
         daemon=True,
     )
     thread.start()
 
-    # Run the Qt event loop (overlay stays visible)
-    overlay_app.exec()
+    # Run the Qt event loop
+    app.exec()
 
 
 if __name__ == "__main__":

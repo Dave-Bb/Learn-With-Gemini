@@ -11,6 +11,7 @@ import os
 import random
 import re
 import struct
+import queue as thread_queue
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -140,15 +141,20 @@ Ignore grid lines/labels in screen images. Start speaking immediately.
 PLAN_PROMPT = """\
 Create a step-by-step tutorial plan for: {topic}
 
-Return ONLY 5-6 short step descriptions, one per line. No numbers, no bullets, \
-no extra text. Keep it concise — max 6 steps. Example:
+Return ONLY short step descriptions, one per line. No numbers, no bullets, \
+no extra text. Use 8-12 steps — break things down into small, clear actions. \
+Each step should be a single concrete thing the user does. Example:
 
 Open Visual Studio Code
-Create a new Python file
-Write the Hello World code
-Save the file
-Run the program in terminal
-Verify the output
+Click File then New File
+Select Python as the language
+Type the print hello world code
+Save the file with Ctrl+S
+Choose a filename and location
+Open the terminal with Ctrl+backtick
+Type python and the filename to run it
+Check the output says Hello World
+Try changing the message and run again
 """
 
 CALIBRATION_PROMPT = """\
@@ -172,6 +178,29 @@ anything else on screen." Then wait for their request.
 
 Ignore any grid lines or labels in the screen images — those are for the system's \
 internal use. Focus on the actual screen content.
+"""
+
+GREETING_PROMPT = """\
+You are Learn With Gemini, a friendly screen-aware teaching assistant. \
+You can see the user's screen, hear them speak, and speak back.
+
+You just started. Greet the user warmly and briefly — say hello, welcome them, \
+and let them know they can pick a tutorial from the menu on screen or just tell you \
+what they'd like to learn about. Keep it short, friendly, and natural. \
+Do NOT list tutorials yourself — the menu is already visible on screen.
+
+When you receive a [TUTORIAL STARTED] message with a topic and steps, begin tutoring:
+- SPEAK instructions conversationally. One step at a time.
+- Call draw_text_box ONCE per step with "Step N: <summary>" to update the progress tracker.
+- Use find_and_highlight only when the user asks "where is that?" or "show me".
+- Do NOT clutter the screen. Speak first, draw only when needed.
+
+draw_text_box MUST contain "Step N: " or progress won't update.
+
+[SCREEN UPDATE] messages describe what's on screen (errors, code, terminal output). \
+If an error is reported, address it immediately.
+
+Ignore grid lines/labels in screen images.
 """
 
 
@@ -204,14 +233,16 @@ If there is an error message, quote it exactly. Keep your response under 150 wor
 
 
 class TutorSession:
-    def __init__(self, topic: str, overlay_signals: OverlaySignals, audio: AudioManager,
+    def __init__(self, topic, overlay_signals: OverlaySignals, audio: AudioManager,
                  logical_w: int = 1920, logical_h: int = 1080):
-        self.topic = topic
+        self.topic = topic  # None = greeting mode, set later via set_topic()
         self.overlay = overlay_signals
         self.audio = audio
         self._running = False
-        self._screen = mss.mss()
-        self._monitor = self._screen.monitors[1]  # Primary monitor
+        # mss screen capture — created lazily in run() so it lives in the async thread
+        # (mss uses thread-local handles that fail if created in a different thread)
+        self._screen = None
+        self._monitor = None
         # Qt logical screen dimensions — the overlay draws in this coordinate space
         self._logical_w = logical_w
         self._logical_h = logical_h
@@ -223,6 +254,10 @@ class TutorSession:
         self._model_turn_active = False
         # Cached plan — generated once, reused across reconnects
         self._plan_steps = None
+        # Thread-safe queue for receiving topic from UI thread
+        self._topic_queue = thread_queue.Queue()
+        # Only emit connection_ready once (not on reconnects)
+        self._first_connection = True
 
     async def run(self):
         """Connect to Gemini and run the session. Auto-reconnects on errors."""
@@ -233,6 +268,10 @@ class TutorSession:
         if not api_key:
             print("ERROR: No API key found. Set GOOGLE_API_KEY env var.")
             return
+
+        # Create mss in the async thread — mss uses thread-local handles
+        self._screen = mss.mss()
+        self._monitor = self._screen.monitors[1]
 
         self.audio.start()
         reconnect_count = 0
@@ -301,20 +340,23 @@ class TutorSession:
         print(f"[scale] Qt logical: {self._logical_w}x{self._logical_h}, mss monitor: {mss_w}x{mss_h}")
         print(f"[scale] Sending images at: {SEND_IMAGE_W}x{SEND_IMAGE_H} (with grid overlay)")
 
-        # Generate tutorial plan once, reuse on reconnects
-        if self.topic != "CALIBRATION_MODE" and self._plan_steps is None:
-            self._plan_steps = await self._generate_plan(self.topic)
-            self.overlay.set_tutorial.emit(
-                self.topic.split(":")[0] if ":" in self.topic else "Tutorial",
-                self._plan_steps,
-            )
-        plan_steps = self._plan_steps or []
-
+        # Determine system prompt based on current state
         if self.topic == "CALIBRATION_MODE":
             system_instruction = CALIBRATION_PROMPT
-        else:
+        elif self.topic:
+            # Have a topic — generate plan and use tutorial prompt
+            if self._plan_steps is None:
+                self._plan_steps = await self._generate_plan(self.topic)
+                self.overlay.set_tutorial.emit(
+                    self.topic.split(":")[0] if ":" in self.topic else "Tutorial",
+                    self._plan_steps,
+                )
+            plan_steps = self._plan_steps or []
             steps_text = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(plan_steps))
             system_instruction = SYSTEM_PROMPT.format(topic=self.topic, steps_text=steps_text)
+        else:
+            # No topic yet — greeting mode
+            system_instruction = GREETING_PROMPT
 
         config = {
             "response_modalities": ["AUDIO"],
@@ -360,14 +402,19 @@ class TutorSession:
             # Send a kick message to get Gemini to speak first
             if self.topic == "CALIBRATION_MODE":
                 kick = "Session started. There is a magenta calibration target on screen. Introduce yourself and tell the user you can see the target. Wait for them to ask you to point at it."
-            else:
+            elif self.topic:
                 kick = f"Session started. The user wants to learn: {self.topic}. The tutorial plan is already visible on screen. Introduce yourself briefly, then use draw_text_box to show 'Step 1: ...' and begin guiding."
+            else:
+                kick = "Session started. The user just opened the app. Greet them warmly and let them know they can pick a tutorial from the menu or tell you what they'd like to learn."
             await session.send_client_content(
                 turns=[{"role": "user", "parts": [{"text": kick}]}],
                 turn_complete=True,
             )
             print(f"[init] Sent kick message")
-            self.overlay.set_status.emit("Starting...")
+            self.overlay.set_status.emit("Ready")
+            if self._first_connection:
+                self._first_connection = False
+                self.overlay.connection_ready.emit()
 
             tasks = []
             try:
@@ -377,7 +424,10 @@ class TutorSession:
                     tasks.append(tg.create_task(self._receive(session)))
                     tasks.append(tg.create_task(self.audio.capture_mic()))
                     tasks.append(tg.create_task(self.audio.play_speaker()))
-                    if self.topic != "CALIBRATION_MODE":
+                    if not self.topic:
+                        # Greeting mode — wait for topic selection
+                        tasks.append(tg.create_task(self._wait_for_topic(session)))
+                    elif self.topic != "CALIBRATION_MODE":
                         tasks.append(tg.create_task(self._periodic_vision_check(session)))
             except* Exception as eg:
                 # Re-raise the first real error for the reconnect logic
@@ -680,3 +730,66 @@ class TutorSession:
             )
 
         await session.send_tool_response(function_responses=function_responses)
+
+    def set_topic(self, topic: str):
+        """Called from the UI thread when user selects a tutorial topic."""
+        self._topic_queue.put(topic)
+
+    async def _wait_for_topic(self, session):
+        """Poll for topic selection from the UI thread."""
+        while self._running:
+            try:
+                topic = self._topic_queue.get_nowait()
+                self.topic = topic
+                if topic == "CALIBRATION_MODE":
+                    await self._start_calibration(session)
+                else:
+                    await self._start_tutorial(session, topic)
+                return
+            except thread_queue.Empty:
+                await asyncio.sleep(0.1)
+
+    async def _start_tutorial(self, session, topic):
+        """Generate plan and inject tutorial context into the live session."""
+        self._plan_steps = await self._generate_plan(topic)
+        self.overlay.set_tutorial.emit(
+            topic.split(":")[0] if ":" in topic else "Tutorial",
+            self._plan_steps,
+        )
+        steps_text = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(self._plan_steps))
+        inject = (
+            f"[TUTORIAL STARTED] Topic: {topic}\n"
+            f"Steps:\n{steps_text}\n\n"
+            f"The tutorial plan is now visible on screen. "
+            f"Begin guiding the user with Step 1. Use draw_text_box with 'Step 1: ...' to track progress."
+        )
+        if not self._model_turn_active:
+            await session.send_client_content(
+                turns=[{"role": "user", "parts": [{"text": inject}]}],
+                turn_complete=True,
+            )
+        print(f"[topic] Tutorial started: {topic}")
+        # Start periodic vision checks now that we have a topic
+        asyncio.create_task(self._periodic_vision_check(session))
+
+    async def _start_calibration(self, session):
+        """Set up calibration mode after greeting."""
+        margin = 150
+        tx = random.randint(margin, self._logical_w - margin)
+        ty = random.randint(margin, self._logical_h - margin)
+        self.overlay.set_target.emit(tx, ty)
+        target_col = min(tx * GRID_COLS // self._logical_w, GRID_COLS - 1)
+        target_row = min(ty * GRID_ROWS // self._logical_h, GRID_ROWS - 1)
+        target_cell = f"{chr(65 + target_col)}{target_row + 1}"
+        print(f"[calibration] Target at logical ({tx}, {ty}), grid cell {target_cell}")
+
+        inject = (
+            "[CALIBRATION MODE] A magenta circle with crosshairs has been placed on screen. "
+            "Tell the user you can see the calibration target and wait for them to ask you to "
+            "point at it. Use find_and_highlight with 'the magenta circle with crosshairs' when asked."
+        )
+        if not self._model_turn_active:
+            await session.send_client_content(
+                turns=[{"role": "user", "parts": [{"text": inject}]}],
+                turn_complete=True,
+            )

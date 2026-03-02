@@ -25,7 +25,9 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QFont, QColor, QPalette
 
-from overlay import TutorOverlay, StatusWidget, SubtitleWidget, TutorialPanelWidget, TopicMenuWidget, LoadingWidget
+import mss
+
+from overlay import TutorOverlay, StatusPanelWidget, SubtitleWidget, TopicMenuWidget, LoadingWidget, MonitorFlashWidget
 from audio import AudioManager
 from session import TutorSession
 
@@ -169,23 +171,89 @@ def run_session_thread(session):
         loop.close()
 
 
+def build_monitor_map(app):
+    """Build a mapping from Qt screen index to mss monitor index.
+
+    mss.monitors[0] is the virtual combined screen; [1..N] are real monitors.
+    Qt screens are returned by QApplication.screens().
+    We match them by comparing the top-left position of each.
+    """
+    qt_screens = app.screens()
+    with mss.mss() as sct:
+        mss_monitors = sct.monitors[1:]  # skip virtual screen at index 0
+
+    mapping = []  # list of (qt_index, mss_index_1based)
+    for qi, scr in enumerate(qt_screens):
+        geo = scr.geometry()
+        dpr = scr.devicePixelRatio()
+        # Qt gives logical coords; mss may give physical coords on scaled displays
+        qt_x, qt_y = geo.x(), geo.y()
+        best_mss = None
+        best_dist = float("inf")
+        for mi, mon in enumerate(mss_monitors):
+            # Try matching both logical and physical positions
+            dx = abs(mon["left"] - qt_x)
+            dy = abs(mon["top"] - qt_y)
+            dist = dx + dy
+            if dist < best_dist:
+                best_dist = dist
+                best_mss = mi + 1  # mss index is 1-based
+            # Also try with DPR scaling
+            dx2 = abs(mon["left"] - int(qt_x * dpr))
+            dy2 = abs(mon["top"] - int(qt_y * dpr))
+            dist2 = dx2 + dy2
+            if dist2 < best_dist:
+                best_dist = dist2
+                best_mss = mi + 1
+        mapping.append((qi, best_mss or 1))
+        scr_name = scr.name()
+        print(f"[monitor] Qt screen {qi} '{scr_name}' {geo.width()}x{geo.height()} "
+              f"@ ({qt_x},{qt_y}) -> mss monitor {best_mss}")
+
+    return mapping
+
+
 def main():
     app = QApplication(sys.argv)
 
     print("\nStarting Learn With Gemini...\n")
 
-    # Create overlay, status bar, subtitle bar, and tutorial panel
+    # Build Qt screen -> mss monitor mapping
+    monitor_map = build_monitor_map(app)
+
+    # Find the Qt primary screen index
+    qt_screens = app.screens()
+    primary = app.primaryScreen()
+    primary_idx = 0
+    for i, scr in enumerate(qt_screens):
+        if scr == primary:
+            primary_idx = i
+            break
+
+    # Look up matching mss index for the primary screen
+    initial_mss_idx = 1  # fallback
+    for qi, mi in monitor_map:
+        if qi == primary_idx:
+            initial_mss_idx = mi
+            break
+
+    screen_geo = primary.geometry()
+    logical_w = screen_geo.width()
+    logical_h = screen_geo.height()
+    dpr = primary.devicePixelRatio()
+    print(f"[monitor] Primary: Qt screen {primary_idx}, mss monitor {initial_mss_idx}")
+    print(f"[monitor] Logical: {logical_w}x{logical_h} (DPR={dpr})")
+
+    # Create overlay, combined status/tutorial panel, subtitle bar
     overlay = TutorOverlay()
     overlay.show()
 
-    status = StatusWidget()
-    status.show()
+    status_panel = StatusPanelWidget()
+    status_panel._current_screen_idx = primary_idx
+    status_panel.show()
 
     subtitles = SubtitleWidget()
     subtitles.show()
-
-    tutorial_panel = TutorialPanelWidget()
-    tutorial_panel.show()
 
     # Loading screen (shown first) and topic menu (shown after connection)
     loading = LoadingWidget()
@@ -196,27 +264,22 @@ def main():
     # topic_menu starts hidden — shown when connection is ready
 
     # Wire up all signals
-    overlay.signals.set_status.connect(status.set_status)
+    overlay.signals.set_status.connect(status_panel.set_status)
     overlay.signals.set_status.connect(loading.add_message)
-    overlay.signals.mic_active.connect(status.set_mic_active)
-    overlay.signals.speaker_active.connect(status.set_speaker_active)
+    overlay.signals.mic_active.connect(status_panel.set_mic_active)
+    overlay.signals.speaker_active.connect(status_panel.set_speaker_active)
     overlay.signals.set_subtitle.connect(subtitles.set_subtitle)
-    overlay.signals.set_tutorial.connect(tutorial_panel.set_tutorial)
-    overlay.signals.set_current_step.connect(tutorial_panel.set_current_step)
-    overlay.signals.complete_step.connect(tutorial_panel.complete_step)
-    overlay.signals.set_current_task.connect(tutorial_panel.set_task)
-    status.exit_requested.connect(app.quit)
+    overlay.signals.set_tutorial.connect(status_panel.set_tutorial)
+    overlay.signals.set_current_step.connect(status_panel.set_current_step)
+    overlay.signals.complete_step.connect(status_panel.complete_step)
+    overlay.signals.uncomplete_step.connect(status_panel.uncomplete_step)
+    overlay.signals.set_current_task.connect(status_panel.set_task)
+    status_panel.exit_requested.connect(app.quit)
 
-    # Get Qt logical screen dimensions — the overlay draws in this coordinate space
-    screen_geo = app.primaryScreen().geometry()
-    logical_w = screen_geo.width()
-    logical_h = screen_geo.height()
-    dpr = app.primaryScreen().devicePixelRatio()
-    print(f"Qt logical screen: {logical_w}x{logical_h} (DPR={dpr})")
-
-    # Create session in greeting mode (no topic yet)
+    # Create session with the correct mss monitor index
     audio = AudioManager()
-    session = TutorSession(None, overlay.signals, audio, logical_w, logical_h)
+    session = TutorSession(None, overlay.signals, audio, logical_w, logical_h,
+                           mss_index=initial_mss_idx)
 
     # Transition: loading → topic menu when connection is ready
     def on_connection_ready():
@@ -234,15 +297,69 @@ def main():
     topic_menu.topic_selected.connect(on_topic_selected)
 
     # Move target button — randomly repositions the calibration target
+    # Uses current logical dimensions (updated on monitor switch)
+    current_dims = {"w": logical_w, "h": logical_h}
+
     def move_target():
         margin = 150
-        tx = random.randint(margin, logical_w - margin)
-        ty = random.randint(margin, logical_h - margin)
+        tx = random.randint(margin, current_dims["w"] - margin)
+        ty = random.randint(margin, current_dims["h"] - margin)
         overlay.signals.clear_all.emit()
         overlay.signals.set_target.emit(tx, ty)
         print(f"[calibration] Target moved to logical ({tx}, {ty})")
 
-    status.move_target_requested.connect(move_target)
+    status_panel.move_target_requested.connect(move_target)
+
+    # Monitor selection handler
+    # Keep a reference to the flash widget so it doesn't get garbage collected
+    flash_ref = {"widget": None}
+
+    def on_monitor_selected(qt_screen_idx):
+        screens = app.screens()
+        if qt_screen_idx < 0 or qt_screen_idx >= len(screens):
+            return
+
+        scr = screens[qt_screen_idx]
+        geo = scr.geometry()
+
+        # Look up mss index
+        mss_idx = 1
+        for qi, mi in monitor_map:
+            if qi == qt_screen_idx:
+                mss_idx = mi
+                break
+
+        print(f"[monitor] User selected Qt screen {qt_screen_idx} -> mss monitor {mss_idx} "
+              f"({geo.width()}x{geo.height()} @ {geo.x()},{geo.y()})")
+
+        # Flash the selected monitor
+        flash_ref["widget"] = MonitorFlashWidget(geo)
+        flash_ref["widget"].show()
+
+        # Reposition all widgets to the selected monitor
+        overlay.reposition_to_screen(geo)
+        status_panel.reposition_to_screen(geo)
+        subtitles.reposition_to_screen(geo)
+        loading.reposition_to_screen(geo)
+        topic_menu.reposition_to_screen(geo)
+
+        # Update session's monitor and logical dimensions
+        new_w = geo.width()
+        new_h = geo.height()
+        current_dims["w"] = new_w
+        current_dims["h"] = new_h
+        session.set_monitor(mss_idx, new_w, new_h)
+
+    status_panel.monitor_selected.connect(on_monitor_selected)
+
+    # End tutorial handler — show topic menu again
+    def on_end_tutorial():
+        topic_menu.show()
+        overlay.signals.clear_all.emit()
+        session._plan_steps = None
+        print("[menu] Tutorial ended, returning to topic selection")
+
+    status_panel.end_tutorial_requested.connect(on_end_tutorial)
 
     # Start Gemini session in background thread (connects immediately in greeting mode)
     thread = threading.Thread(

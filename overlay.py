@@ -41,9 +41,12 @@ class OverlaySignals(QObject):
     set_tutorial = pyqtSignal(str, object)           # title, list of step strings
     set_current_step = pyqtSignal(int)               # 1-based step number
     complete_step = pyqtSignal(int)                   # 1-based step number
+    uncomplete_step = pyqtSignal(int)                 # 1-based step number — undo completion
     set_current_task = pyqtSignal(str)               # instruction text
     # Connection lifecycle
     connection_ready = pyqtSignal()                  # fired when Gemini session is live
+    # Monitor selection
+    monitor_changed = pyqtSignal(int, int, int)      # mss_index, logical_w, logical_h
 
 
 class TutorOverlay(QWidget):
@@ -83,6 +86,13 @@ class TutorOverlay(QWidget):
         self._cleanup_timer = QTimer(self)
         self._cleanup_timer.timeout.connect(self._cleanup_expired)
         self._cleanup_timer.start(1000)
+
+    def reposition_to_screen(self, geo):
+        """Move overlay to span the given screen geometry."""
+        self.setGeometry(geo)
+        self.hints.clear()
+        self._target = None
+        self.update()
 
     def _on_add_pointer(self, x, y, label):
         self.hints.append({
@@ -277,11 +287,16 @@ class TutorOverlay(QWidget):
         painter.drawEllipse(x - 4, y - 4, 8, 8)
 
 
-class StatusWidget(QWidget):
-    """Clickable status bar in the top-right corner with mic/speaker indicators."""
+class StatusPanelWidget(QWidget):
+    """Combined status bar + tutorial panel. Compact when idle, expands for tutorials."""
 
     exit_requested = pyqtSignal()
     move_target_requested = pyqtSignal()
+    monitor_selected = pyqtSignal(int)  # Qt screen index
+    end_tutorial_requested = pyqtSignal()
+
+    HEADER_H = 44         # height of the status header section
+    PANEL_W = 300         # fixed width
 
     def __init__(self):
         super().__init__()
@@ -293,27 +308,42 @@ class StatusWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
-        screen = QApplication.primaryScreen().geometry()
-        pill_w, pill_h = 300, 40
-        self.setGeometry(screen.width() - pill_w - 20, 16, pill_w, pill_h)
-        self.setFixedSize(pill_w, pill_h)
+        self._current_screen_idx = 0  # track selected monitor
 
+        screen = QApplication.primaryScreen().geometry()
+        self._screen_geo = screen
+        self.setGeometry(
+            screen.x() + screen.width() - self.PANEL_W - 20,
+            screen.y() + 16,
+            self.PANEL_W, self.HEADER_H,
+        )
+        self.setFixedSize(self.PANEL_W, self.HEADER_H)
+
+        # Status state
         self._status_text = "Starting..."
         self._mic_on = False
         self._speaker_on = False
 
+        # Tutorial state
+        self._title = ""
+        self._steps = []
+        self._completed = set()
+        self._current = 0
+        self._task_text = ""
+
         # Drag state
         self._drag_pos = None
 
-        # Pulse animation for the activity dot
+        # Pulse animation
         self._pulse_phase = 0
         self._pulse_timer = QTimer(self)
         self._pulse_timer.timeout.connect(self._tick_pulse)
-        self._pulse_timer.start(80)  # ~12fps animation
+        self._pulse_timer.start(80)
+
+    # ── Status methods ──────────────────────────────────────────────
 
     def _tick_pulse(self):
         self._pulse_phase = (self._pulse_phase + 1) % 20
-        # Only repaint if something is active (saves CPU when idle)
         if self._mic_on or self._speaker_on or "Processing" in self._status_text:
             self.update()
 
@@ -329,21 +359,108 @@ class StatusWidget(QWidget):
         self._speaker_on = active
         self.update()
 
+    # ── Tutorial methods ────────────────────────────────────────────
+
+    def set_tutorial(self, title: str, steps):
+        self._title = title
+        self._steps = list(steps)
+        self._completed = set()
+        self._current = 1 if steps else 0
+        self._resize_to_fit()
+        self.update()
+
+    def set_current_step(self, step_num: int):
+        self._current = step_num
+        self.update()
+
+    def complete_step(self, step_num: int):
+        self._completed.add(step_num)
+        self.update()
+
+    def uncomplete_step(self, step_num: int):
+        self._completed.discard(step_num)
+        self.update()
+
+    def set_task(self, text: str):
+        self._task_text = text
+        self._resize_to_fit()
+        self.update()
+
+    def clear_tutorial(self):
+        self._title = ""
+        self._steps = []
+        self._completed = set()
+        self._current = 0
+        self._task_text = ""
+        self._resize_to_fit()
+        self.update()
+
+    # ── Layout ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _wrap_text(text, metrics, max_w):
+        words = text.split()
+        lines = []
+        cur = ""
+        for word in words:
+            test = f"{cur} {word}".strip()
+            if metrics.horizontalAdvance(test) > max_w:
+                if cur:
+                    lines.append(cur)
+                cur = word
+            else:
+                cur = test
+        if cur:
+            lines.append(cur)
+        return lines or [""]
+
+    def _resize_to_fit(self):
+        if not self._steps:
+            h = self.HEADER_H
+        else:
+            line_h = 28
+            title_h = 42
+            task_h = 0
+            if self._task_text:
+                font = QFont("Segoe UI", 10)
+                from PyQt6.QtGui import QFontMetrics
+                metrics = QFontMetrics(font)
+                task_lines = self._wrap_text(self._task_text, metrics, self.PANEL_W - 24)
+                task_line_h = metrics.height() + 2
+                task_h = 40 + len(task_lines) * task_line_h
+            max_h = (self._screen_geo.height() - 120) if self._screen_geo else 900
+            h = min(self.HEADER_H + title_h + len(self._steps) * line_h + 20 + task_h, max_h)
+        self.setFixedSize(self.PANEL_W, h)
+
+    def reposition_to_screen(self, geo):
+        self._screen_geo = geo
+        self.move(geo.x() + geo.width() - self.PANEL_W - 20, geo.y() + 16)
+        self._resize_to_fit()
+
+    # ── Painting ────────────────────────────────────────────────────
+
     def paintEvent(self, event):
-        import math
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
 
-        # Pulse factor (0.0 to 1.0, smooth sine wave)
         pulse = (math.sin(self._pulse_phase * math.pi / 10) + 1) / 2
 
-        # Background pill
-        painter.setPen(QPen(QColor(15, 52, 96), 1))
-        painter.setBrush(QBrush(QColor(20, 20, 40, 220)))
-        painter.drawRoundedRect(0, 0, w, h, h // 2, h // 2)
+        # Background
+        if self._steps:
+            painter.setPen(QPen(QColor(15, 52, 96, 60), 1))
+            painter.setBrush(QBrush(QColor(12, 15, 30, 220)))
+            painter.drawRoundedRect(0, 0, w, h, 10, 10)
+        else:
+            painter.setPen(QPen(QColor(15, 52, 96), 1))
+            painter.setBrush(QBrush(QColor(20, 20, 40, 220)))
+            painter.drawRoundedRect(0, 0, w, h, h // 2, h // 2)
 
-        # Mic indicator dot — pulses when active
+        # ── Status header ───────────────────────────────────────────
+        hh = self.HEADER_H
+        hcy = hh // 2  # vertical center of header
+
+        # Mic indicator dot
         if self._mic_on:
             mic_alpha = int(150 + 105 * pulse)
             mic_size = int(10 + 4 * pulse)
@@ -353,15 +470,14 @@ class StatusWidget(QWidget):
             mic_color = QColor(80, 80, 80)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(mic_color))
-        offset = (mic_size - 10) // 2
-        painter.drawEllipse(14 - offset, h // 2 - 5 - offset, mic_size, mic_size)
+        off = (mic_size - 10) // 2
+        painter.drawEllipse(14 - off, hcy - 5 - off, mic_size, mic_size)
 
-        # Mic label
         painter.setPen(QPen(QColor(150, 150, 150)))
         painter.setFont(QFont("Segoe UI", 8))
-        painter.drawText(28, h // 2 + 4, "MIC")
+        painter.drawText(28, hcy + 4, "MIC")
 
-        # Speaker indicator dot — pulses when active
+        # Speaker indicator dot
         if self._speaker_on:
             spk_alpha = int(150 + 105 * pulse)
             spk_size = int(10 + 4 * pulse)
@@ -370,12 +486,11 @@ class StatusWidget(QWidget):
             spk_size = 10
             spk_color = QColor(80, 80, 80)
         painter.setBrush(QBrush(spk_color))
-        offset = (spk_size - 10) // 2
-        painter.drawEllipse(56 - offset, h // 2 - 5 - offset, spk_size, spk_size)
+        off = (spk_size - 10) // 2
+        painter.drawEllipse(56 - off, hcy - 5 - off, spk_size, spk_size)
 
-        # Speaker label
         painter.setPen(QPen(QColor(150, 150, 150)))
-        painter.drawText(70, h // 2 + 4, "OUT")
+        painter.drawText(70, hcy + 4, "OUT")
 
         # Status text
         status = self._status_text
@@ -384,7 +499,6 @@ class StatusWidget(QWidget):
         elif "Speaking" in status:
             color = QColor(80, 180, 255)
         elif "Processing" in status:
-            # Pulsing orange for processing
             alpha = int(150 + 105 * pulse)
             color = QColor(255, 184, 108, alpha)
         elif "Error" in status or "Failed" in status:
@@ -397,9 +511,97 @@ class StatusWidget(QWidget):
 
         painter.setPen(QPen(color))
         painter.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        painter.drawText(100, h // 2 + 5, status)
+        painter.drawText(100, hcy + 5, status)
+
+        # ── Tutorial section (only if steps exist) ──────────────────
+        if self._steps:
+            # Divider below header
+            painter.setPen(QPen(QColor(60, 80, 120, 100), 1))
+            painter.drawLine(12, hh, w - 12, hh)
+
+            # Title
+            painter.setPen(QPen(QColor(83, 168, 255)))
+            painter.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+            painter.drawText(16, hh + 26, self._title)
+
+            # Divider below title
+            painter.setPen(QPen(QColor(60, 80, 120, 100), 1))
+            painter.drawLine(16, hh + 36, w - 16, hh + 36)
+
+            # Steps
+            y_offset = hh + 48
+            line_h = 28
+
+            for i, step_text in enumerate(self._steps):
+                step_num = i + 1
+                is_completed = step_num in self._completed
+                is_current = step_num == self._current
+
+                if is_current and not is_completed:
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QBrush(QColor(83, 168, 255, 25)))
+                    painter.drawRoundedRect(4, y_offset - 4, w - 8, line_h, 4, 4)
+
+                ix = 16
+                iy = y_offset
+
+                if is_completed:
+                    painter.setPen(QPen(QColor(80, 250, 123), 2))
+                    painter.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+                    painter.drawText(ix, iy + 16, "\u2713")
+                elif is_current:
+                    painter.setPen(QPen(QColor(83, 168, 255), 2))
+                    painter.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+                    painter.drawText(ix, iy + 16, "\u25b6")
+                else:
+                    painter.setPen(QPen(QColor(80, 80, 100)))
+                    painter.setFont(QFont("Segoe UI", 10))
+                    painter.drawText(ix, iy + 15, f"{step_num}.")
+
+                tx = 36
+                max_text_w = w - tx - 12
+
+                if is_completed:
+                    painter.setPen(QPen(QColor(80, 250, 123, 150)))
+                    painter.setFont(QFont("Segoe UI", 10))
+                elif is_current:
+                    painter.setPen(QPen(QColor(240, 240, 240)))
+                    painter.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+                else:
+                    painter.setPen(QPen(QColor(120, 120, 140)))
+                    painter.setFont(QFont("Segoe UI", 10))
+
+                metrics = painter.fontMetrics()
+                display = metrics.elidedText(step_text, Qt.TextElideMode.ElideRight, max_text_w)
+                painter.drawText(tx, iy + 16, display)
+
+                y_offset += line_h
+
+            # Task section
+            if self._task_text:
+                painter.setPen(QPen(QColor(60, 80, 120, 100), 1))
+                painter.drawLine(16, y_offset + 4, w - 16, y_offset + 4)
+
+                badge_y = y_offset + 14
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(QColor(83, 168, 255)))
+                painter.drawRoundedRect(12, badge_y, 42, 20, 4, 4)
+                painter.setPen(QPen(QColor(255, 255, 255)))
+                painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+                painter.drawText(18, badge_y + 14, "TASK")
+
+                painter.setPen(QPen(QColor(240, 240, 240)))
+                painter.setFont(QFont("Segoe UI", 10))
+                metrics = painter.fontMetrics()
+                max_text_w = w - 24
+                task_lines = self._wrap_text(self._task_text, metrics, max_text_w)
+                task_line_h = metrics.height() + 2
+                for i, line in enumerate(task_lines):
+                    painter.drawText(12, badge_y + 36 + i * task_line_h, line)
 
         painter.end()
+
+    # ── Interaction ─────────────────────────────────────────────────
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -434,6 +636,29 @@ class StatusWidget(QWidget):
             }
         """)
 
+        # End Tutorial (only when a tutorial is active)
+        if self._steps:
+            end_action = QAction("End Tutorial", self)
+            end_action.triggered.connect(self._on_end_tutorial)
+            menu.addAction(end_action)
+            menu.addSeparator()
+
+        # Monitor selection submenu
+        screens = QApplication.screens()
+        if len(screens) > 1:
+            monitor_menu = QMenu("Select Monitor", self)
+            monitor_menu.setStyleSheet(menu.styleSheet())
+            for i, scr in enumerate(screens):
+                geo = scr.geometry()
+                label = f"Monitor {i + 1}: {geo.width()}x{geo.height()}"
+                if i == self._current_screen_idx:
+                    label += "  (current)"
+                action = QAction(label, self)
+                action.triggered.connect(lambda checked, idx=i: self._on_select_monitor(idx))
+                monitor_menu.addAction(action)
+            menu.addMenu(monitor_menu)
+            menu.addSeparator()
+
         move_target_action = QAction("Move Target", self)
         move_target_action.triggered.connect(self._on_move_target)
         menu.addAction(move_target_action)
@@ -445,6 +670,14 @@ class StatusWidget(QWidget):
         menu.addAction(exit_action)
 
         menu.exec(self.mapToGlobal(event.pos()))
+
+    def _on_end_tutorial(self):
+        self.clear_tutorial()
+        self.end_tutorial_requested.emit()
+
+    def _on_select_monitor(self, idx):
+        self._current_screen_idx = idx
+        self.monitor_selected.emit(idx)
 
     def _on_move_target(self):
         self.move_target_requested.emit()
@@ -471,14 +704,14 @@ class SubtitleWidget(QWidget):
         self._drag_pos = None
 
         screen = QApplication.primaryScreen().geometry()
-        sub_w = 700
-        sub_h = 60
+        self._sub_w = 700
+        self._sub_h = 60
         self.setGeometry(
-            (screen.width() - sub_w) // 2,
-            screen.height() - sub_h - 60,
-            sub_w, sub_h,
+            screen.x() + (screen.width() - self._sub_w) // 2,
+            screen.y() + screen.height() - self._sub_h - 60,
+            self._sub_w, self._sub_h,
         )
-        self.setFixedSize(sub_w, sub_h)
+        self.setFixedSize(self._sub_w, self._sub_h)
 
         self._text = ""
         self._visible_until = 0
@@ -487,6 +720,13 @@ class SubtitleWidget(QWidget):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._check_hide)
         self._timer.start(500)
+
+    def reposition_to_screen(self, geo):
+        """Move subtitle bar to bottom-center of the given screen geometry."""
+        self.move(
+            geo.x() + (geo.width() - self._sub_w) // 2,
+            geo.y() + geo.height() - self._sub_h - 60,
+        )
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -559,220 +799,6 @@ class SubtitleWidget(QWidget):
         painter.end()
 
 
-class TutorialPanelWidget(QWidget):
-    """Always-visible step list panel — draggable, starts on the right side."""
-
-    def __init__(self):
-        super().__init__()
-        self.setWindowFlags(
-            Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.Tool
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.setCursor(Qt.CursorShape.OpenHandCursor)
-
-        screen = QApplication.primaryScreen().geometry()
-        self._panel_w = 300
-        self._panel_max_h = screen.height() - 120
-        self.setGeometry(
-            screen.width() - self._panel_w - 20, 64,
-            self._panel_w, self._panel_max_h,
-        )
-
-        self._title = ""
-        self._steps = []          # list of step strings
-        self._completed = set()   # set of 1-based step numbers
-        self._current = 0         # 1-based current step (0 = none)
-        self._visible = False
-        self._task_text = ""      # current task instruction
-
-        # Drag state
-        self._drag_pos = None
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
-
-    def mouseMoveEvent(self, event):
-        if self._drag_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
-
-    def mouseReleaseEvent(self, event):
-        self._drag_pos = None
-        self.setCursor(Qt.CursorShape.OpenHandCursor)
-
-    def set_tutorial(self, title: str, steps):
-        self._title = title
-        self._steps = list(steps)
-        self._completed = set()
-        self._current = 1 if steps else 0
-        self._visible = True
-        self._resize_to_fit()
-        self.update()
-
-    def set_current_step(self, step_num: int):
-        self._current = step_num
-        self.update()
-
-    def complete_step(self, step_num: int):
-        self._completed.add(step_num)
-        self.update()
-
-    def set_task(self, text: str):
-        self._task_text = text
-        self._resize_to_fit()
-        self.update()
-
-    def clear_task(self):
-        self._task_text = ""
-        self._resize_to_fit()
-        self.update()
-
-    @staticmethod
-    def _wrap_text(text, metrics, max_w):
-        """Word-wrap text to fit within max_w pixels."""
-        words = text.split()
-        lines = []
-        cur = ""
-        for word in words:
-            test = f"{cur} {word}".strip()
-            if metrics.horizontalAdvance(test) > max_w:
-                if cur:
-                    lines.append(cur)
-                cur = word
-            else:
-                cur = test
-        if cur:
-            lines.append(cur)
-        return lines or [""]
-
-    def _resize_to_fit(self):
-        # Estimate height: title + steps + optional task section
-        line_h = 28
-        header_h = 50
-        task_h = 0
-        if self._task_text:
-            # Calculate wrapped task lines for height
-            font = QFont("Segoe UI", 10)
-            from PyQt6.QtGui import QFontMetrics
-            metrics = QFontMetrics(font)
-            max_text_w = self._panel_w - 24
-            task_lines = self._wrap_text(self._task_text, metrics, max_text_w)
-            task_line_h = metrics.height() + 2
-            task_h = 40 + len(task_lines) * task_line_h  # badge + lines
-        needed = header_h + len(self._steps) * line_h + 20 + task_h
-        h = min(needed, self._panel_max_h)
-        self.setFixedSize(self._panel_w, h)
-
-    def paintEvent(self, event):
-        if not self._visible or not self._steps:
-            return
-
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-
-        # Background
-        painter.setPen(QPen(QColor(15, 52, 96, 60), 1))
-        painter.setBrush(QBrush(QColor(12, 15, 30, 210)))
-        painter.drawRoundedRect(0, 0, w, h, 10, 10)
-
-        # Title
-        painter.setPen(QPen(QColor(83, 168, 255)))
-        painter.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
-        painter.drawText(16, 30, self._title)
-
-        # Divider
-        painter.setPen(QPen(QColor(60, 80, 120, 100), 1))
-        painter.drawLine(16, 42, w - 16, 42)
-
-        # Steps
-        y_offset = 56
-        line_h = 28
-
-        for i, step_text in enumerate(self._steps):
-            step_num = i + 1
-            is_completed = step_num in self._completed
-            is_current = step_num == self._current
-
-            # Current step highlight bar
-            if is_current and not is_completed:
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QBrush(QColor(83, 168, 255, 25)))
-                painter.drawRoundedRect(4, y_offset - 4, w - 8, line_h, 4, 4)
-
-            # Icon
-            ix = 16
-            iy = y_offset
-
-            if is_completed:
-                # Green checkmark
-                painter.setPen(QPen(QColor(80, 250, 123), 2))
-                painter.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
-                painter.drawText(ix, iy + 16, "\u2713")
-            elif is_current:
-                # Blue arrow
-                painter.setPen(QPen(QColor(83, 168, 255), 2))
-                painter.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-                painter.drawText(ix, iy + 16, "\u25b6")
-            else:
-                # Dim number
-                painter.setPen(QPen(QColor(80, 80, 100)))
-                painter.setFont(QFont("Segoe UI", 10))
-                painter.drawText(ix, iy + 15, f"{step_num}.")
-
-            # Step text
-            tx = 36
-            max_text_w = w - tx - 12
-
-            if is_completed:
-                painter.setPen(QPen(QColor(80, 250, 123, 150)))
-                painter.setFont(QFont("Segoe UI", 10))
-            elif is_current:
-                painter.setPen(QPen(QColor(240, 240, 240)))
-                painter.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-            else:
-                painter.setPen(QPen(QColor(120, 120, 140)))
-                painter.setFont(QFont("Segoe UI", 10))
-
-            # Truncate if too long
-            metrics = painter.fontMetrics()
-            display = metrics.elidedText(step_text, Qt.TextElideMode.ElideRight, max_text_w)
-            painter.drawText(tx, iy + 16, display)
-
-            y_offset += line_h
-
-        # Current task section (below steps)
-        if self._task_text:
-            # Divider
-            painter.setPen(QPen(QColor(60, 80, 120, 100), 1))
-            painter.drawLine(16, y_offset + 4, w - 16, y_offset + 4)
-
-            # "TASK" badge
-            badge_y = y_offset + 14
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(QColor(83, 168, 255)))
-            painter.drawRoundedRect(12, badge_y, 42, 20, 4, 4)
-            painter.setPen(QPen(QColor(255, 255, 255)))
-            painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-            painter.drawText(18, badge_y + 14, "TASK")
-
-            # Task text — word wrapped
-            painter.setPen(QPen(QColor(240, 240, 240)))
-            painter.setFont(QFont("Segoe UI", 10))
-            metrics = painter.fontMetrics()
-            max_text_w = w - 24
-            task_lines = self._wrap_text(self._task_text, metrics, max_text_w)
-            task_line_h = metrics.height() + 2
-            for i, line in enumerate(task_lines):
-                painter.drawText(12, badge_y + 36 + i * task_line_h, line)
-
-        painter.end()
-
-
 class LoadingWidget(QWidget):
     """Loading screen with spinner and status log — shown during initial connection."""
 
@@ -786,14 +812,14 @@ class LoadingWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
         screen = QApplication.primaryScreen().geometry()
-        panel_w = 420
-        panel_h = 320
+        self._panel_w = 420
+        self._panel_h = 320
         self.setGeometry(
-            (screen.width() - panel_w) // 2,
-            (screen.height() - panel_h) // 2,
-            panel_w, panel_h,
+            screen.x() + (screen.width() - self._panel_w) // 2,
+            screen.y() + (screen.height() - self._panel_h) // 2,
+            self._panel_w, self._panel_h,
         )
-        self.setFixedSize(panel_w, panel_h)
+        self.setFixedSize(self._panel_w, self._panel_h)
 
         self._angle = 0
         self._messages = []
@@ -802,6 +828,13 @@ class LoadingWidget(QWidget):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(33)  # ~30fps
+
+    def reposition_to_screen(self, geo):
+        """Center loading widget on the given screen geometry."""
+        self.move(
+            geo.x() + (geo.width() - self._panel_w) // 2,
+            geo.y() + (geo.height() - self._panel_h) // 2,
+        )
 
     def _tick(self):
         self._angle = (self._angle + 8) % 360
@@ -888,17 +921,24 @@ class TopicMenuWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
         screen = QApplication.primaryScreen().geometry()
-        panel_w = 440
-        panel_h = 500
+        self._menu_w = 440
+        self._menu_h = 500
         self.setGeometry(
-            (screen.width() - panel_w) // 2,
-            (screen.height() - panel_h) // 2,
-            panel_w, panel_h,
+            screen.x() + (screen.width() - self._menu_w) // 2,
+            screen.y() + (screen.height() - self._menu_h) // 2,
+            self._menu_w, self._menu_h,
         )
-        self.setFixedSize(panel_w, panel_h)
+        self.setFixedSize(self._menu_w, self._menu_h)
 
         self._drag_pos = None
         self._setup_ui()
+
+    def reposition_to_screen(self, geo):
+        """Center topic menu on the given screen geometry."""
+        self.move(
+            geo.x() + (geo.width() - self._menu_w) // 2,
+            geo.y() + (geo.height() - self._menu_h) // 2,
+        )
 
     def _setup_ui(self):
         layout = QVBoxLayout()
@@ -1019,3 +1059,49 @@ class TopicMenuWidget(QWidget):
 
     def mouseReleaseEvent(self, event):
         self._drag_pos = None
+
+
+class MonitorFlashWidget(QWidget):
+    """Temporary full-screen flash on a monitor to confirm selection."""
+
+    def __init__(self, geometry):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setGeometry(geometry)
+
+        # Auto-close after 800ms
+        QTimer.singleShot(800, self._finish)
+
+    def _finish(self):
+        self.close()
+        self.deleteLater()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # Semi-transparent cyan flash
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(0, 180, 255, 50)))
+        painter.drawRect(0, 0, w, h)
+
+        # Border highlight
+        painter.setPen(QPen(QColor(83, 168, 255, 180), 6))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(3, 3, w - 6, h - 6)
+
+        # "SELECTED" text in center
+        painter.setPen(QPen(QColor(255, 255, 255, 200)))
+        painter.setFont(QFont("Segoe UI", 48, QFont.Weight.Bold))
+        text_rect = QRectF(0, 0, w, h)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, "SELECTED")
+
+        painter.end()

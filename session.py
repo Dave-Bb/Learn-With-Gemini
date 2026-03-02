@@ -234,7 +234,7 @@ If there is an error message, quote it exactly. Keep your response under 150 wor
 
 class TutorSession:
     def __init__(self, topic, overlay_signals: OverlaySignals, audio: AudioManager,
-                 logical_w: int = 1920, logical_h: int = 1080):
+                 logical_w: int = 1920, logical_h: int = 1080, mss_index: int = 1):
         self.topic = topic  # None = greeting mode, set later via set_topic()
         self.overlay = overlay_signals
         self.audio = audio
@@ -243,6 +243,7 @@ class TutorSession:
         # (mss uses thread-local handles that fail if created in a different thread)
         self._screen = None
         self._monitor = None
+        self._mss_index = mss_index  # which mss monitor to capture
         # Qt logical screen dimensions — the overlay draws in this coordinate space
         self._logical_w = logical_w
         self._logical_h = logical_h
@@ -256,8 +257,14 @@ class TutorSession:
         self._plan_steps = None
         # Thread-safe queue for receiving topic from UI thread
         self._topic_queue = thread_queue.Queue()
+        # Thread-safe queue for monitor changes from UI thread
+        self._monitor_queue = thread_queue.Queue()
         # Only emit connection_ready once (not on reconnects)
         self._first_connection = True
+
+    def set_monitor(self, mss_index, logical_w, logical_h):
+        """Thread-safe: request switching to a different monitor."""
+        self._monitor_queue.put((mss_index, logical_w, logical_h))
 
     async def run(self):
         """Connect to Gemini and run the session. Auto-reconnects on errors."""
@@ -271,7 +278,7 @@ class TutorSession:
 
         # Create mss in the async thread — mss uses thread-local handles
         self._screen = mss.mss()
-        self._monitor = self._screen.monitors[1]
+        self._monitor = self._screen.monitors[self._mss_index]
 
         self.audio.start()
         reconnect_count = 0
@@ -424,10 +431,9 @@ class TutorSession:
                     tasks.append(tg.create_task(self._receive(session)))
                     tasks.append(tg.create_task(self.audio.capture_mic()))
                     tasks.append(tg.create_task(self.audio.play_speaker()))
-                    if not self.topic:
-                        # Greeting mode — wait for topic selection
-                        tasks.append(tg.create_task(self._wait_for_topic(session)))
-                    elif self.topic != "CALIBRATION_MODE":
+                    # Always listen for topic changes (new tutorial or end tutorial)
+                    tasks.append(tg.create_task(self._wait_for_topic(session)))
+                    if self.topic and self.topic != "CALIBRATION_MODE":
                         tasks.append(tg.create_task(self._periodic_vision_check(session)))
             except* Exception as eg:
                 # Re-raise the first real error for the reconnect logic
@@ -467,6 +473,18 @@ class TutorSession:
     async def _send_screen(self, session):
         """Capture screen and send frames to Gemini at ~1 FPS."""
         while self._running:
+            # Check for monitor switch requests
+            try:
+                mss_idx, lw, lh = self._monitor_queue.get_nowait()
+                self._monitor = self._screen.monitors[mss_idx]
+                self._mss_index = mss_idx
+                self._logical_w = lw
+                self._logical_h = lh
+                self._scale_ready = False
+                print(f"[monitor] Switched to mss monitor {mss_idx} (logical {lw}x{lh})")
+            except Exception:
+                pass
+
             try:
                 sct_img = self._screen.grab(self._monitor)
                 img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
@@ -691,9 +709,14 @@ class TutorSession:
                 self.overlay.set_current_task.emit(text)
                 step = self._parse_step_from_text(text)
                 if step > 0:
-                    # Complete previous step and advance
-                    if step > 1:
-                        self.overlay.complete_step.emit(step - 1)
+                    # Check if we're going backwards (user asked to redo steps)
+                    plan_len = len(self._plan_steps) if self._plan_steps else 0
+                    # Un-complete any steps from this step onward
+                    for s in range(step, plan_len + 1):
+                        self.overlay.uncomplete_step.emit(s)
+                    # Complete all steps before this one
+                    for s in range(1, step):
+                        self.overlay.complete_step.emit(s)
                     self.overlay.set_current_step.emit(step)
                     print(f"    → step tracking: now on step {step}")
                     result = {"status": "drawn", "step_tracked": step}
@@ -736,16 +759,17 @@ class TutorSession:
         self._topic_queue.put(topic)
 
     async def _wait_for_topic(self, session):
-        """Poll for topic selection from the UI thread."""
+        """Poll for topic selection from the UI thread. Runs continuously."""
         while self._running:
             try:
                 topic = self._topic_queue.get_nowait()
                 self.topic = topic
+                self._plan_steps = None  # reset plan for new topic
                 if topic == "CALIBRATION_MODE":
                     await self._start_calibration(session)
                 else:
                     await self._start_tutorial(session, topic)
-                return
+                # Keep looping — user may end tutorial and pick a new one
             except thread_queue.Empty:
                 await asyncio.sleep(0.1)
 

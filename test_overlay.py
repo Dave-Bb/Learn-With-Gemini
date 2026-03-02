@@ -6,7 +6,7 @@ import sys
 import time
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import QTimer
-from overlay import TutorOverlay, StatusWidget
+from overlay import TutorOverlay, StatusPanelWidget
 
 
 def main():
@@ -14,7 +14,7 @@ def main():
     overlay = TutorOverlay()
     overlay.show()
 
-    status = StatusWidget()
+    status = StatusPanelWidget()
     status.show()
     overlay.signals.set_status.connect(status.set_status)
 
